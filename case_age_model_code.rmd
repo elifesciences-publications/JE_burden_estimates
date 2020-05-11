@@ -1,0 +1,130 @@
+---
+title: Estimates of the global burden of Japanese Encephalitis and the impact of vaccination
+  from 2000-2015
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Loading library  
+
+```{r load_library}
+library(rstan)
+library(dplyr)
+```  
+
+## Setting up stan code  
+
+```{r stan_code}
+ll_case_je = "
+
+data {
+
+  int N;  //number of age groups
+  vector[N] age_l; //lower bound of the age group
+  vector[N] age_u; //upper bound of the age group
+  vector[N] case_age; //number of cases in each age group.
+  vector[N] pop_age; //population demo of the study year.
+  real t_case; //total cases in every groups
+  vector[N] alpha_prior;
+  vector[N] beta_prior;
+
+}
+
+parameters {
+
+  real<lower = 0> lambda;
+  real r_raw;
+  vector[N] sp_raw;
+
+}
+
+transformed parameters {
+
+  vector[N] i_age; //the incidence rate in each age group
+  vector[N] e_age; //The expected number of cases in each age group
+  real<lower = 0, upper = 1> rho = inv_logit(r_raw); // logit transform
+  vector<lower = 0, upper = 1>[N] s_prop = inv_logit(sp_raw); // logit transform
+  
+  i_age = (exp(-lambda*age_l) - exp(-lambda*(age_u + 1)))*rho;
+  e_age = (pop_age .* s_prop) .* i_age;
+
+}
+
+model {
+
+  real l_MN;
+  //prior distribution
+  lambda ~ normal(0, 1000);
+  r_raw ~ normal(0, 100);
+  sp_raw ~ normal(0, 100);
+  rho ~ beta(0.1, 9.9);
+  s_prop ~ beta(alpha_prior, beta_prior);
+
+  //MN likelihood function:
+  l_MN = lgamma(t_case + 1) - sum(lgamma(case_age + 1)) + sum(case_age .* log(e_age/sum(e_age))); 
+  
+  //likelihood function, included poisson for total cases across all age group:
+  target += l_MN + t_case*log(sum(e_age)) - sum(e_age) - lgamma(t_case + 1) +
+  //Jacobian adjustment
+            log(rho) + log(1 - rho) + sum(log(s_prop) + log(1 - s_prop));
+}
+"
+stan_case_model = stan_model(model_code = ll_case_je)
+```  
+
+## Model run  
+
+```{r model_run}
+#If run only aggregated data and stand alone data but not cohort data, use this code:
+case_age_data = read.csv(paste0( "case_age_data.csv"), 1, colClasses = NA)
+case_age_data_id = case_age_data$subnation
+
+#model run, extract parameter:
+l_summary_data = list()
+All_model_results = c()
+for(i in 1:length(unique(case_age_data_id))){
+  ###Model run
+  #select study:
+  study_i = case_age_data[case_age_data_id %in% unique(case_age_data_id)[i],]
+  
+  print(unique(case_age_data_id)[i])
+  
+  #Get age group info:
+  age_group_split = strsplit(as.character(study_i$Age_group),"-")
+  age_l = unlist(lapply(age_group_split, FUN = f <- function(x){as.numeric(x[1])}))
+  age_u = unlist(lapply(age_group_split, FUN = f <- function(x){as.numeric(x[2])}))
+  
+  #Set up prior for suscetible proportion:
+  phi_beta_prior = 5
+  s_prop_all = round(study_i$Pop_all_age_year_sum/study_i$Naive_pop_all_age_year_sum, 6)
+  s_prop_all[s_prop_all == 0] = 10^-2
+  s_prop_all[s_prop_all == 1] = 99*10^-2
+  #mean:
+  alpha_prior = phi_beta_prior*s_prop_all #prop prior
+  beta_prior = phi_beta_prior*(1 - s_prop_all) #prop prior
+  
+  #Number of age group:
+  N = nrow(study_i) 
+  
+  #Comprise data for stan:
+  data_for_HMC = list(N = N, age_l = age_l, age_u = age_u, alpha_prior = alpha_prior, beta_prior = beta_prior, 
+                      case_age = study_i$Case_Sero, pop_age = study_i$Naive_pop_all_age_year_sum, t_case = sum(study_i$Case_Sero))
+  mcmc_interation = 16000
+  #MCMC
+  stan_FOI_fit = sampling(object = stan_case_model, data = data_for_HMC, 
+                          chains = 4, cores = 4, iter = mcmc_interation, thin = 20, control=list(adapt_delta=0.99, max_treedepth = 15))
+  
+  #Extrac model results:
+  All_model_results[i] = list(model = list(stan_FOI_fit), model_data = study_i)
+  print(which(summary(stan_FOI_fit)$summary[,"Rhat"] > 1.05))
+  extracted_data = extract(stan_FOI_fit, c("lambda", "rho"))
+  l_summary_data[[i]] = list(model_data = study_i, parameter = extracted_data, rhat = rhat(stan_FOI_fit))
+}
+names(l_summary_data) = unique(case_age_data_id)
+saveRDS(l_summary_data, paste("prior_cov_every_studies.rds", sep = ""))
+names(All_model_results) = unique(case_age_data_id)
+saveRDS(All_model_results, paste("All_model_results.rds", sep = ""))
+```  
